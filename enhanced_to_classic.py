@@ -8,6 +8,7 @@ A script to convert multi-frame DICOM (aka "enhanced dicom") to single-frame DIC
 import os
 import sys
 import re
+import argparse
 import unicodedata
 import pydicom, pydicom.uid
 from copy import deepcopy
@@ -73,7 +74,7 @@ def _enhanced_to_classic(enh_dcm:pydicom.Dataset) -> list[pydicom.Dataset]:
     try:
         dcm_base=deepcopy(enh_dcm)  # read b/c deepcopy threw errors
     except:
-        print(f"could not deepcopy enhanced input, attempting to ready from source")
+        print(f"could not deepcopy enhanced input, attempting to re-read from source file")
         dcm_base=pydicom.dcmread(enh_dcm.filename)  # read b/c deepcopy threw errors
     if dcm_base.get('filename',None) == None:
         print(f"WARNING - could not start base dicom from input, using default Dataset")
@@ -180,6 +181,11 @@ def slicelocation_from_imageposition(ds:pydicom.Dataset):
         return
     ipp = ds.get("ImagePositionPatient")
     iop = ds.get("ImageOrientationPatient")
+    if (ipp) and (not iop):
+        print("Missing image orientation, forcing axial view")  # HACK
+        ds.SliceLocation = ipp[2]
+        ds.ImageOrientationPatient = [1,0,0,0,1,0]
+        return
     if (not ipp) or (not iop):
         return
     if   iop[2]==0 and iop[5]==0: # Rz = Cz = 0, axial
@@ -191,7 +197,7 @@ def slicelocation_from_imageposition(ds:pydicom.Dataset):
     return
 
 
-def save_classic(classic_dcm:list[pydicom.Dataset], output_folder, human_readable=False)->list[str]:
+def save_classic(classic_dcm:list[pydicom.Dataset], output_folder:str|Path, human_readable=False)->list[str]:
     """
     save_classic():
     Saves a list of dicom files (ostensibly classic)
@@ -201,27 +207,29 @@ def save_classic(classic_dcm:list[pydicom.Dataset], output_folder, human_readabl
         'f{base_filename}{InstanceNumber}.dcm'
     """
     # test create output directory
-    try:
-        os.makedirs(output_folder, exist_ok=True)
-    except:
-        raise RuntimeError(f"Cannot create output folder {output_folder}")
+    output_folder = Path(output_folder)
+    # try:
+    #     output_folder.mkdir(parents=True, exist_ok=True)
+    # except:
+    #     raise RuntimeError(f"Cannot create output folder {output_folder}")
     
     #Saving classic DICOMs
     new_file_paths=[]
     for dcm in classic_dcm:
         output_filename = str(dcm.get('SOPInstanceUID','ERR_NO_SOP_UID'))
-        output_subfolder = str(dcm.get('SeriesInstanceUID','ERR_NO_SERIES_UID'))
-        # check and create series subfolders
+        # output_subfolder = str(dcm.get('SeriesInstanceUID','ERR_NO_SERIES_UID'))
         if human_readable:
-            output_filename = f"IMG{int(dcm.get('InstanceNumber',0)):05d}"
-            output_subfolder = f"{dcm.get('SeriesNumber','X')}_{dcm.get('SeriesDescription','NODESC')}"
-        my_output_folder = os.path.join(output_folder, output_subfolder)
-        file_path_out = os.path.join(my_output_folder, f'{output_filename}.dcm')
-        file_path_out = sanitize_path(file_path_out)
-        if os.path.exists(file_path_out):
+            output_filename = f"IMG{int(dcm.get('InstanceNumber',0)):05d}_{output_filename}"
+            # output_subfolder = f"{dcm.get('SeriesNumber','X')}_{dcm.get('SeriesDescription','NODESC')}"
+        file_path_out = output_folder / Path(f'{output_filename}.dcm')
+        # file_path_out = Path(sanitize_path(str(file_path_out)))
+        if file_path_out.exists():
             print(f"overwriting {file_path_out}")
-        os.makedirs(os.path.dirname(file_path_out), exist_ok=True)
-        dcm.save_as(file_path_out)
+        try:
+            file_path_out.parent.mkdir(parents=True, exist_ok=True)
+        except:
+            raise RuntimeError(f"Cannot create output folder {output_folder}")
+        dcm.save_as(str(file_path_out))
         new_file_paths.append(file_path_out)
     return new_file_paths
 
@@ -305,7 +313,7 @@ def sanitize_path_component(
 
 
 def sanitize_path(
-    path: str,
+    path: str|Path,
     replacement: str = "_",
     for_windows: bool = True,
     for_posix: bool = True,
@@ -364,36 +372,47 @@ def sanitize_path(
 
     return sanitized
 
-
-
-
-
-if __name__ == '__main__':
-    input_arg = sys.argv[1]
+def main(input_arg:str|Path, recursive:bool = False):
     if os.path.isfile(input_arg):
-        print(f"Convering enhnaced file to classic: {input_arg}")
+        print(f"Converting enhanced file to classic: {input_arg}")
         file_list = [Path(input_arg)]
-        output_dir = f"{os.path.dirname(input_arg)}_classic_dicom"
+        src_dir = Path(input_arg).parent
+        output_dir = Path(f"{os.path.dirname(input_arg)}_classic_dicom")
     else:
         print(f"Creating classic DICOM from all enhanced files in directory {input_arg}")
-        output_dir = f"{input_arg}_classic_dicom"
+        print(f"  Recursive scan is {recursive}")
         src_dir = Path(input_arg)
-        file_list = [p for p in src_dir.rglob('*') if p.is_file()]
-    print(f"Outputs will be saved to {output_dir}")
+        output_dir = Path(f"{input_arg}_classic_dicom")
+        paths = src_dir.rglob('*') if recursive else src_dir.iterdir()
+        file_list = [p for p in paths if p.is_file()]
 
-    print(f"Converting {len(file_list)} files...")
+    print(f"Outputs will be saved to {output_dir}")
+    print(f"Attempting to convert {len(file_list)} files...")
+    output_dir.mkdir(exist_ok=True)
     for enh_file in file_list:
         try:
             enh_dcm = pydicom.dcmread(enh_file)
+        except:
+            continue # quietly continue if not a DICOM
+        try:
             if 'PixelData' not in enh_dcm:
                 continue
             classic_files = convert_dicom_enhanced_to_classic(enh_dcm)
             print(f'Saving {enh_file} as {len(classic_files)} classic DICOMs')
-            # save_classic(classic_files, output_dir)
-            save_classic(classic_files, output_dir, human_readable=True)
-        except: 
-            print(f"ERROR converting {enh_file}")
+            ehn_file_output_dir = output_dir / enh_file.parent.relative_to(src_dir)
+            print(f'   output directory {ehn_file_output_dir}')
+            save_classic(classic_files, ehn_file_output_dir)
+        except Exception as e: 
+            print(f"ERROR converting and saving {enh_file}: {e}")
             continue
 
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description="Convert enhanced DICOM files to classic DICOM files."
+    )
+    parser.add_argument("input_arg", type=Path)
+    parser.add_argument("-r", "--recursive", action="store_true")
+    args = parser.parse_args()
+    main(args.input_arg, args.recursive)
 
 
